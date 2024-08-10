@@ -62,7 +62,10 @@ def resnet_multiimage_input(num_layers, pretrained=False, num_input_images=1, pr
         state_dict['conv1.weight'] = conv1_weight
         
         # Load the modified state dict into the model
+        print("resnet encoder is pretrained")
         model.load_state_dict(state_dict, strict=False)
+    else:
+        print("resnet encoder is NOT pretrained")
 
     return model
 

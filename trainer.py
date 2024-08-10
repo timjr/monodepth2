@@ -6,6 +6,8 @@
 
 from __future__ import absolute_import, division, print_function
 
+import datetime
+import json
 import numpy as np
 import time
 
@@ -29,7 +31,13 @@ from IPython import embed
 class Trainer:
     def __init__(self, options):
         self.opt = options
-        self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name)
+        nowstamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+        self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name, nowstamp)
+        os.makedirs(self.log_path)
+
+        # save the options for this run in the output directory
+        with open(os.path.join(self.log_path, "options.json"), 'w') as opts_json:
+            json.dump(vars(self.opt), opts_json, indent=4, sort_keys=True)
 
         # checking height and width are multiples of 32
         assert self.opt.height % 32 == 0, "'height' must be a multiple of 32"
@@ -111,7 +119,7 @@ class Trainer:
             self.load_model()
 
         print("Training model named:\n  ", self.opt.model_name)
-        print("Models and tensorboard events files are saved to:\n  ", self.opt.log_dir)
+        print("Models and tensorboard events files are saved to:\n  ", self.log_path)
         print("Training is using:\n  ", self.device)
 
         # data
@@ -215,7 +223,7 @@ class Trainer:
             duration = time.time() - before_op_time
 
             # log less frequently after the first 2000 steps to save time & disk space
-            early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 2000
+            early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 20000000
             late_phase = self.step % 2000 == 0
 
             if early_phase or late_phase:
