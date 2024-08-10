@@ -27,7 +27,6 @@ import datasets
 import networks
 from IPython import embed
 
-
 class Trainer:
     def __init__(self, options):
         self.opt = options
@@ -35,7 +34,9 @@ class Trainer:
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name, nowstamp)
         os.makedirs(self.log_path)
 
-        # save the options for this run in the output directory
+        # save the options for this run in the output directory XXX
+        # this is somewhat redundant with save_opts() below, just a
+        # different output path
         with open(os.path.join(self.log_path, "options.json"), 'w') as opts_json:
             json.dump(vars(self.opt), opts_json, indent=4, sort_keys=True)
 
@@ -55,21 +56,29 @@ class Trainer:
         assert self.opt.frame_ids[0] == 0, "frame_ids must start with 0"
 
         self.use_pose_net = not (self.opt.use_stereo and self.opt.frame_ids == [0])
+        if self.use_pose_net:
+            print("using pose net")
 
         if self.opt.use_stereo:
             self.opt.frame_ids.append("s")
 
         self.models["encoder"] = networks.ResnetEncoder(
             self.opt.num_layers, self.opt.weights_init == "pretrained")
+
+        print("sending encoder model to device")        
         self.models["encoder"].to(self.device)
+
+        # Example: attach to a specific layer
+
+        print("done sending encoder model to device")
         self.parameters_to_train += list(self.models["encoder"].parameters())
 
         
         self.models["depth"] = networks.DepthDecoder(
             self.models["encoder"].num_ch_enc, self.opt.scales)
-        print("sending model to device")
+        print("sending depth decoder model to device")
         self.models["depth"].to(self.device)
-        print("done sending model to device")        
+        print("done sending depth decoder model to device")        
         self.parameters_to_train += list(self.models["depth"].parameters())
         
 
@@ -80,7 +89,9 @@ class Trainer:
                     self.opt.weights_init == "pretrained",
                     num_input_images=self.num_pose_frames)
 
+                print("sending pose encoder to device")
                 self.models["pose_encoder"].to(self.device)
+                print("done sending pose encoder to device")
                 self.parameters_to_train += list(self.models["pose_encoder"].parameters())
 
                 self.models["pose"] = networks.PoseDecoder(
@@ -96,7 +107,9 @@ class Trainer:
                 self.models["pose"] = networks.PoseCNN(
                     self.num_input_frames if self.opt.pose_model_input == "all" else 2)
 
+            print("sending pose decoder to device")
             self.models["pose"].to(self.device)
+            print("done sending pose decoder to device")
             self.parameters_to_train += list(self.models["pose"].parameters())
 
         if self.opt.predictive_mask:
@@ -111,11 +124,14 @@ class Trainer:
             self.models["predictive_mask"].to(self.device)
             self.parameters_to_train += list(self.models["predictive_mask"].parameters())
 
+        print("instantiating adam trainer with", len(self.parameters_to_train),
+              "tensors to train, and", self.opt.learning_rate, "learning rate")
         self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
         self.model_lr_scheduler = optim.lr_scheduler.StepLR(
             self.model_optimizer, self.opt.scheduler_step_size, 0.1)
 
         if self.opt.load_weights_folder is not None:
+            print("loading weights from", self.opt.load_weights_folder)
             self.load_model()
 
         print("Training model named:\n  ", self.opt.model_name)
@@ -211,6 +227,8 @@ class Trainer:
 
         for batch_idx, inputs in enumerate(self.train_loader):
 
+            initial_weights = [param.clone() for param in self.models["encoder"].parameters()]
+
             before_op_time = time.time()
 
             outputs, losses = self.process_batch(inputs)
@@ -218,7 +236,12 @@ class Trainer:
             self.model_optimizer.zero_grad()
             losses["loss"].backward()
             self.model_optimizer.step()
-            self.model_lr_scheduler.step()
+            # self.model_lr_scheduler.step()
+
+            # total_change = 0
+            # for initial, current in zip(initial_weights, self.models["encoder"].parameters()):
+            #     total_change += torch.norm(current - initial)
+            # print("Weight change: ", total_change)
 
             duration = time.time() - before_op_time
 
@@ -275,6 +298,10 @@ class Trainer:
         """Predict poses between input frames for monocular sequences.
         """
         outputs = {}
+        # print(f"in predict poses, inputs shape is {len(inputs)} features shape is {len(features)}")
+        # for i, f in enumerate(features):
+        #     print(f"in predict poses features {i} shape is {f.shape}")
+
         if self.num_pose_frames == 2:
             # In this setting, we compute the pose to each source frame via a
             # separate forward pass through the pose network.
@@ -551,13 +578,15 @@ class Trainer:
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
     def log(self, mode, inputs, outputs, losses):
-        """Write an event to the tensorboard events file
-        """
+        """Write an event to the tensorboard events file"""
         writer = self.writers[mode]
+
+        # Log losses
         for l, v in losses.items():
             writer.add_scalar("{}".format(l), v, self.step)
 
-        for j in range(min(4, self.opt.batch_size)):  # write a maxmimum of four images
+        # Log images
+        for j in range(min(4, self.opt.batch_size)):  # write a maximum of four images
             for s in self.opt.scales:
                 for frame_id in self.opt.frame_ids:
                     writer.add_image(
@@ -584,6 +613,70 @@ class Trainer:
                         "automask_{}/{}".format(s, j),
                         outputs["identity_selection/{}".format(s)][j][None, ...], self.step)
 
+        # Log weight distributions and gradients for all models
+        for name, model in self.models.items():
+            for pname, pvalue in model.named_parameters():
+                writer.add_histogram(f'{name}/{pname}_weights', pvalue, self.step)
+                if pvalue.grad is not None:
+                    writer.add_histogram(f'{name}/{pname}_gradients', pvalue.grad, self.step)
+
+        # # Log model graphs (only on the first step)
+        # if self.step == 0:
+        #     # Log the encoder model graph
+        #     writer.add_graph(self.models["encoder"], inputs[("color_aug", 0, 0)])
+
+        #     # Generate features using the encoder model
+        #     features = self.models["encoder"](inputs[("color_aug", 0, 0)])
+
+        #     # Ensure features are passed correctly to DepthDecoder
+        #     depth_input = features
+        #     print("features type is", type(depth_input))
+        #     writer.add_graph(FlattenOutputWrapper(self.models["depth"]), depth_input)
+
+        #     # Log the pose network model graph, if it exists
+        #     if self.use_pose_net:
+        #         if self.num_pose_frames == 2:
+        #             if self.opt.pose_model_type == "shared":
+        #                 pose_feats = {f_i: features[f_i] for f_i in self.opt.frame_ids}
+        #             else:
+        #                 pose_feats = {f_i: inputs["color_aug", f_i, 0] for f_i in self.opt.frame_ids}
+
+        #             for f_i in self.opt.frame_ids[1:]:
+        #                 if f_i != "s":
+        #                     if f_i < 0:
+        #                         pose_inputs = [pose_feats[f_i], pose_feats[0]]
+        #                     else:
+        #                         pose_inputs = [pose_feats[0], pose_feats[f_i]]
+
+        #                     if self.opt.pose_model_type == "separate_resnet":
+        #                         pose_inputs = torch.cat(pose_inputs, 1)
+        #                         pose_inputs = self.models["pose_encoder"](pose_inputs)
+        #                     elif self.opt.pose_model_type == "posecnn":
+        #                         pose_inputs = torch.cat(pose_inputs, 1)
+
+        #                     writer.add_graph(self.models["pose"], pose_inputs)
+
+        #         else:
+        #             # For num_pose_frames > 2, concatenate all frames
+        #             if self.opt.pose_model_type in ["separate_resnet", "posecnn"]:
+        #                 pose_inputs = torch.cat(
+        #                     [inputs[("color_aug", i, 0)] for i in self.opt.frame_ids if i != "s"], 1)
+
+        #                 if self.opt.pose_model_type == "separate_resnet":
+        #                     pose_inputs = self.models["pose_encoder"](pose_inputs)
+
+        #             elif self.opt.pose_model_type == "shared":
+        #                 pose_inputs = [features[i] for i in self.opt.frame_ids if i != "s"]
+
+        #             writer.add_graph(self.models["pose"], pose_inputs)
+        # end graph fail
+
+            # # Optionally, log hyperparameters (only on the first step)
+            # if mode == "train" and self.step == 0:
+            #     writer.add_hparams(vars(self.opt), {"train_loss": losses["loss"]})
+
+            writer.flush()  # Ensure everything is written to disk
+        
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with
         """
@@ -641,3 +734,44 @@ class Trainer:
             self.model_optimizer.load_state_dict(optimizer_dict)
         else:
             print("Cannot find Adam weights so Adam is randomly initialized")
+
+
+# This is a hack to deal with the tuple keys in the depth model, which
+# are not supported by the torch jit trace thing, (it causes the error
+# "RuntimeError: Cannot create dict for key type '(str, int)', only
+# int, float, complex, Tensor, device and string keys are supported").
+# I want to be non-invasive while debugging, so in lieu of changing
+# the code to use string keys like disp_0 instead of (disp, 0), I'll
+# do it in a wrapper.
+class FlattenOutputWrapper(torch.nn.Module):
+    def __init__(self, model):
+        super(FlattenOutputWrapper, self).__init__()
+        self.model = model
+
+    def forward(self, *inputs):
+        outputs = self.model(*inputs)
+        # Flatten dictionary keys if they are tuples
+        if isinstance(outputs, dict):
+            flattened_outputs = {}
+            for k, v in outputs.items():
+                if isinstance(k, tuple):
+                    flat_key = "_".join(map(str, k))
+                    flattened_outputs[flat_key] = v
+                else:
+                    flattened_outputs[k] = v
+            return flattened_outputs
+        return outputs
+    
+# class TupleKeyWrapper(torch.nn.Module):
+#     def __init__(self, depth_decoder):
+#         super(TupleKeyWrapper, self).__init__()
+#         self.depth_decoder = depth_decoder
+
+#     def forward(self, *inputs):
+#         outputs = self.depth_decoder(*inputs)
+#         # Flatten the outputs to make them TorchScript-compatible
+#         flat_outputs = []
+#         for key, value in outputs.items():
+#             flat_outputs.append(value)
+#         return flat_outputs
+            
