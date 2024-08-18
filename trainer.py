@@ -598,16 +598,17 @@ class Trainer:
 
     def log_time(self, batch_idx, duration, loss):
         """Print a logging statement to the terminal"""
-        # Calculate the effective batch size considering different batch sizes per rank
-        effective_batch_size = self.opt.batch_size * self.batch_size_factor * self.world_size  # Adjusted for varying batch sizes
+        # Calculate the effective batch size for the current rank
+        effective_batch_size = self.opt.batch_size  # This is already adjusted per rank
 
+        # Calculate examples per second for this rank
         samples_per_sec = effective_batch_size / duration
 
         time_sofar = time.time() - self.start_time
 
         # Adjust the calculation of training time left
         adjusted_total_steps = self.num_total_steps / self.world_size
-        training_time_left = (adjusted_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
+        training_time_left = (adjusted_total_steps / (self.step + 1) - 1.0) * time_sofar if self.step > 0 else 0
 
         print_string = "rank {:>2} -- epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
                        " | loss: {:.5f} | time elapsed: {} | time left: {}"
