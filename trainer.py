@@ -36,6 +36,8 @@ class Trainer:
         self.rank = rank
         self.world_size = world_size
 
+        print(f"world size is {world_size} and rank is {rank}")
+        
         # I have asymmetric GPUs (0 is a 3090 and 1 is a 4060 Ti)
         self.batch_size_factor = 1
         self.learning_rate_factor = 1
@@ -50,13 +52,6 @@ class Trainer:
         self.opt.batch_size = int(self.opt.batch_size * self.batch_size_factor)
         self.opt.learning_rate = self.opt.learning_rate * self.learning_rate_factor
             
-        #   torchrun --nproc_per_node=3 train.py --model_name mono_model
-        # Allows me to balance my 3090 with my 4060 ti
-        if rank == 0 or rank == 1:
-            device = torch.device('cuda:0')  # Both rank 0 and 1 use the larger GPU (GPU 0)
-        elif rank == 2:
-            device = torch.device('cuda:1')  # Rank 2 uses the smaller GPU (GPU 1)
-
         # Initialize the process group
         dist.init_process_group(backend='nccl', rank=self.rank, world_size=self.world_size)
 
