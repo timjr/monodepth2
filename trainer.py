@@ -18,6 +18,7 @@ from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 from torch.nn import SyncBatchNorm
 import torch.distributed as dist
+from torch.utils.data.distributed import DistributedSampler
 
 import json
 
@@ -35,11 +36,30 @@ class Trainer:
         self.rank = rank
         self.world_size = world_size
 
+        # I have asymmetric GPUs (0 is a 3090 and 1 is a 4060 Ti)
+        self.batch_size_factor = 1
+        self.learning_rate_factor = 1
+        if rank == 0:
+            device = torch.device('cuda:0')
+            self.batch_size_factor *= 2
+            self.learning_rate_factor *= 0.5
+        elif rank == 1:
+            device = torch.device('cuda:1')
+    
+        #   torchrun --nproc_per_node=3 train.py --model_name mono_model
+        # Allows me to balance my 3090 with my 4060 ti
+        if rank == 0 or rank == 1:
+            device = torch.device('cuda:0')  # Both rank 0 and 1 use the larger GPU (GPU 0)
+        elif rank == 2:
+            device = torch.device('cuda:1')  # Rank 2 uses the smaller GPU (GPU 1)
+
         # Initialize the process group
         dist.init_process_group(backend='nccl', rank=self.rank, world_size=self.world_size)
-        self.device = torch.device(f'cuda:{rank}')
-        torch.cuda.set_device(self.rank)
-        
+
+        # Set the correct device
+        self.device = device
+        torch.cuda.set_device(device)  # Use the correct device variable
+
         nowstamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
         self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name, f"{nowstamp}_rank{self.rank}")
         os.makedirs(self.log_path, exist_ok=True)
@@ -147,9 +167,23 @@ class Trainer:
         train_dataset = self.dataset(
             self.opt.data_path, train_filenames, self.opt.height, self.opt.width,
             self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
+
+        # Wrap the train dataset with DistributedSampler
+        self.train_sampler = DistributedSampler(
+            train_dataset, num_replicas=self.world_size, rank=self.rank)
+
+        # Use the sampler in the DataLoader
         self.train_loader = DataLoader(
-            train_dataset, self.opt.batch_size, True,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+            train_dataset,
+            batch_size=self.opt.batch_size,
+            shuffle=False,  # DistributedSampler handles shuffling
+            num_workers=self.opt.num_workers,
+            pin_memory=True,
+            drop_last=True,
+            sampler=self.train_sampler  # Ensure this is passed to the DataLoader
+        )
+
+        # Initialize validation dataset (not using DistributedSampler here)
         val_dataset = self.dataset(
             self.opt.data_path, val_filenames, self.opt.height, self.opt.width,
             self.opt.frame_ids, 4, is_train=False, img_ext=img_ext)
@@ -566,12 +600,18 @@ class Trainer:
     def log_time(self, batch_idx, duration, loss):
         """Print a logging statement to the terminal
         """
-        samples_per_sec = self.opt.batch_size / duration
+        # Adjusted for distributed training: considering the total number of GPUs (world_size)
+        samples_per_sec = (self.opt.batch_size * self.world_size) / duration
+
         time_sofar = time.time() - self.start_time
-        training_time_left = (
-            self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
+
+        # Adjust the calculation of training time left
+        adjusted_total_steps = self.num_total_steps / self.world_size
+        training_time_left = (adjusted_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
+
         print_string = "rank {:>2} -- epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
-            " | loss: {:.5f} | time elapsed: {} | time left: {}"
+                       " | loss: {:.5f} | time elapsed: {} | time left: {}"
+
         print(print_string.format(self.rank, self.epoch, batch_idx, samples_per_sec, loss,
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
