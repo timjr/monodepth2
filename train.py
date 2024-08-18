@@ -5,6 +5,7 @@
 # available in the LICENSE file.
 
 from __future__ import absolute_import, division, print_function
+import os
 
 from trainer import Trainer
 from options import MonodepthOptions
@@ -14,5 +15,8 @@ opts = options.parse()
 
 
 if __name__ == "__main__":
-    trainer = Trainer(opts)
+    rank = int(os.environ['RANK'])
+    world_size = int(os.environ['WORLD_SIZE'])
+    
+    trainer = Trainer(opts, rank=rank, world_size=world_size)
     trainer.train()

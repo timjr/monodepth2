@@ -16,6 +16,8 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
+from torch.nn import SyncBatchNorm
+import torch.distributed as dist
 
 import json
 
@@ -28,11 +30,19 @@ import networks
 from IPython import embed
 
 class Trainer:
-    def __init__(self, options):
+    def __init__(self, options, rank, world_size):
         self.opt = options
+        self.rank = rank
+        self.world_size = world_size
+
+        # Initialize the process group
+        dist.init_process_group(backend='nccl', rank=self.rank, world_size=self.world_size)
+        self.device = torch.device(f'cuda:{rank}')
+        torch.cuda.set_device(self.rank)
+        
         nowstamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name, nowstamp)
-        os.makedirs(self.log_path)
+        self.log_path = os.path.join(self.opt.log_dir, self.opt.model_name, f"{nowstamp}_rank{self.rank}")
+        os.makedirs(self.log_path, exist_ok=True)
 
         # save the options for this run in the output directory XXX
         # this is somewhat redundant with save_opts() below, just a
@@ -46,8 +56,6 @@ class Trainer:
 
         self.models = {}
         self.parameters_to_train = []
-
-        self.device = torch.device("cpu" if self.opt.no_cuda else "cuda")
 
         self.num_scales = len(self.opt.scales)
         self.num_input_frames = len(self.opt.frame_ids)
@@ -64,23 +72,9 @@ class Trainer:
 
         self.models["encoder"] = networks.ResnetEncoder(
             self.opt.num_layers, self.opt.weights_init == "pretrained")
-
-        print("sending encoder model to device")        
-        self.models["encoder"].to(self.device)
-
-        # Example: attach to a specific layer
-
-        print("done sending encoder model to device")
-        self.parameters_to_train += list(self.models["encoder"].parameters())
-
         
         self.models["depth"] = networks.DepthDecoder(
             self.models["encoder"].num_ch_enc, self.opt.scales)
-        print("sending depth decoder model to device")
-        self.models["depth"].to(self.device)
-        print("done sending depth decoder model to device")        
-        self.parameters_to_train += list(self.models["depth"].parameters())
-        
 
         if self.use_pose_net:
             if self.opt.pose_model_type == "separate_resnet":
@@ -88,11 +82,6 @@ class Trainer:
                     self.opt.num_layers,
                     self.opt.weights_init == "pretrained",
                     num_input_images=self.num_pose_frames)
-
-                print("sending pose encoder to device")
-                self.models["pose_encoder"].to(self.device)
-                print("done sending pose encoder to device")
-                self.parameters_to_train += list(self.models["pose_encoder"].parameters())
 
                 self.models["pose"] = networks.PoseDecoder(
                     self.models["pose_encoder"].num_ch_enc,
@@ -107,11 +96,6 @@ class Trainer:
                 self.models["pose"] = networks.PoseCNN(
                     self.num_input_frames if self.opt.pose_model_input == "all" else 2)
 
-            print("sending pose decoder to device")
-            self.models["pose"].to(self.device)
-            print("done sending pose decoder to device")
-            self.parameters_to_train += list(self.models["pose"].parameters())
-
         if self.opt.predictive_mask:
             assert self.opt.disable_automasking, \
                 "When using predictive_mask, please disable automasking with --disable_automasking"
@@ -121,9 +105,17 @@ class Trainer:
             self.models["predictive_mask"] = networks.DepthDecoder(
                 self.models["encoder"].num_ch_enc, self.opt.scales,
                 num_output_channels=(len(self.opt.frame_ids) - 1))
-            self.models["predictive_mask"].to(self.device)
-            self.parameters_to_train += list(self.models["predictive_mask"].parameters())
 
+        # Convert all BatchNorm layers to SyncBatchNorm
+        # See: https://github.com/pytorch/pytorch/issues/66504
+        for model_name in self.models:
+            self.models[model_name] = SyncBatchNorm.convert_sync_batchnorm(self.models[model_name])
+
+        # Move models to the appropriate device
+        for model_name in self.models:
+            self.models[model_name].to(self.device)
+            self.parameters_to_train += list(self.models[model_name].parameters())
+            
         print("instantiating adam trainer with", len(self.parameters_to_train),
               "tensors to train, and", self.opt.learning_rate, "learning rate")
         self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
@@ -194,6 +186,12 @@ class Trainer:
             len(train_dataset), len(val_dataset)))
 
         self.save_opts()
+
+        # Log model graphs (I couldn't get the graphs in tensorboard to work yet)
+        for k, v in self.models.items():
+            print(f"model: {k}")
+            print(v)
+            print()
 
     def set_train(self):
         """Convert all models to training mode
@@ -572,9 +570,9 @@ class Trainer:
         time_sofar = time.time() - self.start_time
         training_time_left = (
             self.num_total_steps / self.step - 1.0) * time_sofar if self.step > 0 else 0
-        print_string = "epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
+        print_string = "rank {:>2} -- epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
             " | loss: {:.5f} | time elapsed: {} | time left: {}"
-        print(print_string.format(self.epoch, batch_idx, samples_per_sec, loss,
+        print(print_string.format(self.rank, self.epoch, batch_idx, samples_per_sec, loss,
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
 
     def log(self, mode, inputs, outputs, losses):
@@ -619,13 +617,6 @@ class Trainer:
                 writer.add_histogram(f'{name}/{pname}_weights', pvalue, self.step)
                 if pvalue.grad is not None:
                     writer.add_histogram(f'{name}/{pname}_gradients', pvalue.grad, self.step)
-
-        # Log model graphs (only on the first step)
-        if self.step == 0 and mode == 'train':
-            for k, v in self.models.items():
-                print(f"model: {k}")
-                print(v)
-                print()
 
         writer.flush()  # Ensure everything is written to disk
         
