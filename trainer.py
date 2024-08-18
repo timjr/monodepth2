@@ -621,10 +621,11 @@ class Trainer:
                     writer.add_histogram(f'{name}/{pname}_gradients', pvalue.grad, self.step)
 
         # Log model graphs (only on the first step)
-        for k, v in self.models:
-            print(f"model: {k}")
-            print(v)
-            print
+        if self.step == 0 and mode == 'train':
+            for k, v in self.models.items():
+                print(f"model: {k}")
+                print(v)
+                print()
 
         writer.flush()  # Ensure everything is written to disk
         
