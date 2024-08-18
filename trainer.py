@@ -620,62 +620,13 @@ class Trainer:
                 if pvalue.grad is not None:
                     writer.add_histogram(f'{name}/{pname}_gradients', pvalue.grad, self.step)
 
-        # # Log model graphs (only on the first step)
-        # if self.step == 0:
-        #     # Log the encoder model graph
-        #     writer.add_graph(self.models["encoder"], inputs[("color_aug", 0, 0)])
+        # Log model graphs (only on the first step)
+        for k, v in self.models:
+            print(f"model: {k}")
+            print(v)
+            print
 
-        #     # Generate features using the encoder model
-        #     features = self.models["encoder"](inputs[("color_aug", 0, 0)])
-
-        #     # Ensure features are passed correctly to DepthDecoder
-        #     depth_input = features
-        #     print("features type is", type(depth_input))
-        #     writer.add_graph(FlattenOutputWrapper(self.models["depth"]), depth_input)
-
-        #     # Log the pose network model graph, if it exists
-        #     if self.use_pose_net:
-        #         if self.num_pose_frames == 2:
-        #             if self.opt.pose_model_type == "shared":
-        #                 pose_feats = {f_i: features[f_i] for f_i in self.opt.frame_ids}
-        #             else:
-        #                 pose_feats = {f_i: inputs["color_aug", f_i, 0] for f_i in self.opt.frame_ids}
-
-        #             for f_i in self.opt.frame_ids[1:]:
-        #                 if f_i != "s":
-        #                     if f_i < 0:
-        #                         pose_inputs = [pose_feats[f_i], pose_feats[0]]
-        #                     else:
-        #                         pose_inputs = [pose_feats[0], pose_feats[f_i]]
-
-        #                     if self.opt.pose_model_type == "separate_resnet":
-        #                         pose_inputs = torch.cat(pose_inputs, 1)
-        #                         pose_inputs = self.models["pose_encoder"](pose_inputs)
-        #                     elif self.opt.pose_model_type == "posecnn":
-        #                         pose_inputs = torch.cat(pose_inputs, 1)
-
-        #                     writer.add_graph(self.models["pose"], pose_inputs)
-
-        #         else:
-        #             # For num_pose_frames > 2, concatenate all frames
-        #             if self.opt.pose_model_type in ["separate_resnet", "posecnn"]:
-        #                 pose_inputs = torch.cat(
-        #                     [inputs[("color_aug", i, 0)] for i in self.opt.frame_ids if i != "s"], 1)
-
-        #                 if self.opt.pose_model_type == "separate_resnet":
-        #                     pose_inputs = self.models["pose_encoder"](pose_inputs)
-
-        #             elif self.opt.pose_model_type == "shared":
-        #                 pose_inputs = [features[i] for i in self.opt.frame_ids if i != "s"]
-
-        #             writer.add_graph(self.models["pose"], pose_inputs)
-        # end graph fail
-
-            # # Optionally, log hyperparameters (only on the first step)
-            # if mode == "train" and self.step == 0:
-            #     writer.add_hparams(vars(self.opt), {"train_loss": losses["loss"]})
-
-            writer.flush()  # Ensure everything is written to disk
+        writer.flush()  # Ensure everything is written to disk
         
     def save_opts(self):
         """Save options to disk so we know what we ran this experiment with
@@ -735,43 +686,3 @@ class Trainer:
         else:
             print("Cannot find Adam weights so Adam is randomly initialized")
 
-
-# This is a hack to deal with the tuple keys in the depth model, which
-# are not supported by the torch jit trace thing, (it causes the error
-# "RuntimeError: Cannot create dict for key type '(str, int)', only
-# int, float, complex, Tensor, device and string keys are supported").
-# I want to be non-invasive while debugging, so in lieu of changing
-# the code to use string keys like disp_0 instead of (disp, 0), I'll
-# do it in a wrapper.
-class FlattenOutputWrapper(torch.nn.Module):
-    def __init__(self, model):
-        super(FlattenOutputWrapper, self).__init__()
-        self.model = model
-
-    def forward(self, *inputs):
-        outputs = self.model(*inputs)
-        # Flatten dictionary keys if they are tuples
-        if isinstance(outputs, dict):
-            flattened_outputs = {}
-            for k, v in outputs.items():
-                if isinstance(k, tuple):
-                    flat_key = "_".join(map(str, k))
-                    flattened_outputs[flat_key] = v
-                else:
-                    flattened_outputs[k] = v
-            return flattened_outputs
-        return outputs
-    
-# class TupleKeyWrapper(torch.nn.Module):
-#     def __init__(self, depth_decoder):
-#         super(TupleKeyWrapper, self).__init__()
-#         self.depth_decoder = depth_decoder
-
-#     def forward(self, *inputs):
-#         outputs = self.depth_decoder(*inputs)
-#         # Flatten the outputs to make them TorchScript-compatible
-#         flat_outputs = []
-#         for key, value in outputs.items():
-#             flat_outputs.append(value)
-#         return flat_outputs
-            
