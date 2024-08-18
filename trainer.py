@@ -45,7 +45,11 @@ class Trainer:
             self.learning_rate_factor *= 0.5
         elif rank == 1:
             device = torch.device('cuda:1')
-    
+
+        # Adjust batch size and learning rate
+        self.opt.batch_size = int(self.opt.batch_size * self.batch_size_factor)
+        self.opt.learning_rate = self.opt.learning_rate * self.learning_rate_factor
+            
         #   torchrun --nproc_per_node=3 train.py --model_name mono_model
         # Allows me to balance my 3090 with my 4060 ti
         if rank == 0 or rank == 1:
@@ -598,10 +602,11 @@ class Trainer:
             losses[metric] = np.array(depth_errors[i].cpu())
 
     def log_time(self, batch_idx, duration, loss):
-        """Print a logging statement to the terminal
-        """
-        # Adjusted for distributed training: considering the total number of GPUs (world_size)
-        samples_per_sec = (self.opt.batch_size * self.world_size) / duration
+        """Print a logging statement to the terminal"""
+        # Calculate the effective batch size considering different batch sizes per rank
+        effective_batch_size = self.opt.batch_size * self.batch_size_factor * self.world_size  # Adjusted for varying batch sizes
+
+        samples_per_sec = effective_batch_size / duration
 
         time_sofar = time.time() - self.start_time
 
@@ -614,7 +619,7 @@ class Trainer:
 
         print(print_string.format(self.rank, self.epoch, batch_idx, samples_per_sec, loss,
                                   sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
-
+            
     def log(self, mode, inputs, outputs, losses):
         """Write an event to the tensorboard events file"""
         writer = self.writers[mode]
