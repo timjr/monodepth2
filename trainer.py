@@ -40,18 +40,15 @@ class Trainer:
         self.batch_size_factors = [2.2, 1]  # Rank 0: 2x samples, Rank 1: 1x samples        
         
         # I have asymmetric GPUs (0 is a 3090 and 1 is a 4060 Ti)
-        self.learning_rate_factor = 1
         if rank == 0:
             device = torch.device('cuda:0')
             self.batch_size_factor = self.batch_size_factors[rank]
-            self.learning_rate_factor *= 0.5
         elif rank == 1:
             device = torch.device('cuda:1')
             self.batch_size_factor = self.batch_size_factors[rank]            
 
         # Adjust batch size and learning rate
         self.opt.batch_size = int(self.opt.batch_size * self.batch_size_factor)
-        self.opt.learning_rate = self.opt.learning_rate * self.learning_rate_factor
             
         # Initialize the process group
         dist.init_process_group(backend='nccl', rank=self.rank, world_size=self.world_size)
@@ -135,7 +132,16 @@ class Trainer:
         for model_name in self.models:
             self.models[model_name].to(self.device)
             self.parameters_to_train += list(self.models[model_name].parameters())
-            
+
+        # Register a hook to scale gradients according to the batch size factor
+        def scale_gradients(grad):
+            return grad * self.batch_size_factors[rank]
+
+        for model_name in self.models:
+            for param in self.models[model_name].parameters():
+                if param.requires_grad:
+                    param.register_hook(scale_gradients)            
+
         print("instantiating adam trainer with", len(self.parameters_to_train),
               "tensors to train, and", self.opt.learning_rate, "learning rate")
         self.model_optimizer = optim.Adam(self.parameters_to_train, self.opt.learning_rate)
