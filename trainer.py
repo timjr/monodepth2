@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from tensorboardX import SummaryWriter
 from torch.nn import SyncBatchNorm
 import torch.distributed as dist
-from torch.utils.data.distributed import DistributedSampler
+from asymmetric_sampler import AsymmetricDistributedSampler
 
 import json
 
@@ -37,16 +37,17 @@ class Trainer:
         self.world_size = world_size
 
         print(f"world size is {world_size} and rank is {rank}")
+        self.batch_size_factors = [2, 1]  # Rank 0: 2x samples, Rank 1: 1x samples        
         
         # I have asymmetric GPUs (0 is a 3090 and 1 is a 4060 Ti)
-        self.batch_size_factor = 1
         self.learning_rate_factor = 1
         if rank == 0:
             device = torch.device('cuda:0')
-            self.batch_size_factor *= 2
+            self.batch_size_factor = self.batch_size_factors[rank]
             self.learning_rate_factor *= 0.5
         elif rank == 1:
             device = torch.device('cuda:1')
+            self.batch_size_factor = self.batch_size_factors[rank]            
 
         # Adjust batch size and learning rate
         self.opt.batch_size = int(self.opt.batch_size * self.batch_size_factor)
@@ -168,10 +169,14 @@ class Trainer:
             self.opt.frame_ids, 4, is_train=True, img_ext=img_ext)
 
         # Wrap the train dataset with DistributedSampler
-        self.train_sampler = DistributedSampler(
-            train_dataset, num_replicas=self.world_size, rank=self.rank)
+        self.train_sampler = AsymmetricDistributedSampler(
+            train_dataset,
+            num_replicas=self.world_size,
+            rank=self.rank,
+            batch_size_factors=self.batch_size_factors
+        )
 
-        # Use the sampler in the DataLoader
+        # Use the asymmetric sampler in the DataLoader
         self.train_loader = DataLoader(
             train_dataset,
             batch_size=self.opt.batch_size,
@@ -179,7 +184,7 @@ class Trainer:
             num_workers=self.opt.num_workers,
             pin_memory=True,
             drop_last=True,
-            sampler=self.train_sampler  # Ensure this is passed to the DataLoader
+            sampler=self.train_sampler
         )
 
         # Initialize validation dataset (not using DistributedSampler here)
@@ -606,9 +611,11 @@ class Trainer:
 
         time_sofar = time.time() - self.start_time
 
-        # Adjust the calculation of training time left
-        adjusted_total_steps = self.num_total_steps / self.world_size
-        training_time_left = (adjusted_total_steps / (self.step + 1) - 1.0) * time_sofar if self.step > 0 else 0
+        # Adjust the total number of steps based on the rank's dataset portion
+        rank_total_steps = self.num_total_steps / self.world_size  # Portion of total steps for this rank
+        rank_total_steps *= (self.batch_size_factor / sum(self.batch_size_factors))  # Adjust for batch size factor
+
+        training_time_left = (rank_total_steps / (self.step + 1) - 1.0) * time_sofar if self.step > 0 else 0
 
         print_string = "rank {:>2} -- epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
                        " | loss: {:.5f} | time elapsed: {} | time left: {}"
