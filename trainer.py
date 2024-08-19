@@ -37,7 +37,7 @@ class Trainer:
         self.world_size = world_size
 
         print(f"world size is {world_size} and rank is {rank}")
-        self.batch_size_factors = [2, 1]  # Rank 0: 2x samples, Rank 1: 1x samples        
+        self.batch_size_factors = [2.2, 1]  # Rank 0: 2x samples, Rank 1: 1x samples        
         
         # I have asymmetric GPUs (0 is a 3090 and 1 is a 4060 Ti)
         self.learning_rate_factor = 1
@@ -173,7 +173,8 @@ class Trainer:
             train_dataset,
             num_replicas=self.world_size,
             rank=self.rank,
-            batch_size_factors=self.batch_size_factors
+            batch_size_factors=self.batch_size_factors,
+            drop_last=True
         )
 
         # Use the asymmetric sampler in the DataLoader
@@ -261,9 +262,11 @@ class Trainer:
         print("Training")
         self.set_train()
 
+        samples_seen = 0
+        batch_counter = 0
         for batch_idx, inputs in enumerate(self.train_loader):
-
-            initial_weights = [param.clone() for param in self.models["encoder"].parameters()]
+            batch_size = inputs[('color', 0, 0)].shape[0]
+            samples_seen += batch_size
 
             before_op_time = time.time()
 
@@ -272,21 +275,15 @@ class Trainer:
             self.model_optimizer.zero_grad()
             losses["loss"].backward()
             self.model_optimizer.step()
-            # self.model_lr_scheduler.step()
+            
+            batch_duration = time.time() - before_op_time
 
-            # total_change = 0
-            # for initial, current in zip(initial_weights, self.models["encoder"].parameters()):
-            #     total_change += torch.norm(current - initial)
-            # print("Weight change: ", total_change)
-
-            duration = time.time() - before_op_time
-
-            # log less frequently after the first 2000 steps to save time & disk space
-            early_phase = batch_idx % self.opt.log_frequency == 0 and self.step < 20000000
-            late_phase = self.step % 2000 == 0
+            # (don't) log less frequently after the first 2000 steps to save time & disk space
+            early_phase = batch_idx % self.opt.log_frequency == 0 # and self.step < 2000
+            late_phase = False # self.step % 2000 == 0
 
             if early_phase or late_phase:
-                self.log_time(batch_idx, duration, losses["loss"].cpu().data)
+                self.log_time(samples_seen, batch_idx, batch_size, batch_duration, losses["loss"].cpu().data)
 
                 if "depth_gt" in inputs:
                     self.compute_depth_losses(inputs, outputs, losses)
@@ -601,27 +598,30 @@ class Trainer:
         for i, metric in enumerate(self.depth_metric_names):
             losses[metric] = np.array(depth_errors[i].cpu())
 
-    def log_time(self, batch_idx, duration, loss):
+    def log_time(self, samples_seen_this_epoch, batch_idx, batch_size, batch_duration, loss):
         """Print a logging statement to the terminal"""
-        # Calculate the effective batch size for the current rank
-        effective_batch_size = self.opt.batch_size  # This is already adjusted per rank
 
-        # Calculate examples per second for this rank
-        samples_per_sec = effective_batch_size / duration
+        total_time_sofar = time.time() - self.start_time
 
-        time_sofar = time.time() - self.start_time
+        # Total samples processed by this rank so far
+        samples_processed = len(self.train_sampler) * self.epoch + samples_seen_this_epoch
 
-        # Adjust the total number of steps based on the rank's dataset portion
-        rank_total_steps = self.num_total_steps / self.world_size  # Portion of total steps for this rank
-        rank_total_steps *= (self.batch_size_factor / sum(self.batch_size_factors))  # Adjust for batch size factor
+        overall_samples_per_sec = samples_processed / total_time_sofar
 
-        training_time_left = (rank_total_steps / (self.step + 1) - 1.0) * time_sofar if self.step > 0 else 0
+        # Total samples to be processed by this rank        
+        rank_total_samples = self.opt.num_epochs * len(self.train_sampler)
 
-        print_string = "rank {:>2} -- epoch {:>3} | batch {:>6} | examples/s: {:5.1f}" + \
+        # Adjust the calculation of progress and time left
+        progress_fraction = samples_processed / rank_total_samples
+        progress_this_epoch = samples_seen_this_epoch / len(self.train_sampler)
+
+        time_left = (rank_total_samples - samples_processed) / overall_samples_per_sec
+
+        print_string = "rank {:>2} -- epoch {:>3} | batch {:>6} took {:>4.1f} sec ({:>3} samples, batch examples/s {:5.1f})  | examples/s: {:5.1f}" + \
                        " | loss: {:.5f} | time elapsed: {} | time left: {}"
 
-        print(print_string.format(self.rank, self.epoch, batch_idx, samples_per_sec, loss,
-                                  sec_to_hm_str(time_sofar), sec_to_hm_str(training_time_left)))
+        print(print_string.format(self.rank, self.epoch, batch_idx, batch_duration, batch_size, batch_size / batch_duration, overall_samples_per_sec, loss,
+                                  sec_to_hm_str(total_time_sofar), sec_to_hm_str(time_left)))
             
     def log(self, mode, inputs, outputs, losses):
         """Write an event to the tensorboard events file"""

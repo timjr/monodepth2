@@ -1,4 +1,5 @@
 import math
+import torch
 from torch.utils.data.distributed import DistributedSampler
 
 class AsymmetricDistributedSampler(DistributedSampler):
@@ -14,14 +15,34 @@ class AsymmetricDistributedSampler(DistributedSampler):
         
         # Adjust the total number of samples and indices based on factors
         self.num_samples = self.num_samples_per_replica[self.rank]
+        print("in the asym constructor, the batch size is", self.num_samples)
+        
 
     def __iter__(self):
-        # Get the indices for the current rank
+        # Generate a list of indices for the dataset
         indices = list(range(len(self.dataset)))
-        indices = indices[self.rank::self.num_replicas]
         
-        # Oversample or undersample based on the batch size factor
-        indices = indices[:self.num_samples]
+        # Shuffle indices
+        if self.shuffle:
+            # Ensure all replicas use the same random seed for shuffling
+            g = torch.Generator()
+            g.manual_seed(self.seed)
+            indices = torch.randperm(len(indices), generator=g).tolist()
+        
+        # Calculate the starting index for this rank
+        start_idx = sum(self.num_samples_per_replica[:self.rank])
+        end_idx = start_idx + self.num_samples
+        
+        # Select the subset of indices for this rank
+        indices = indices[start_idx:end_idx]
+        
+        # Optionally oversample/undersample if needed to match the shard size
+        if len(indices) < self.num_samples:
+            diff = self.num_samples - len(indices)
+            print(f"oversampling by {diff} to meet expected shard size")
+            indices += indices[:diff]
+        else:
+            indices = indices[:self.num_samples]
         
         return iter(indices)
 
