@@ -19,6 +19,8 @@ from tensorboardX import SummaryWriter
 from torch.nn import SyncBatchNorm
 import torch.distributed as dist
 from asymmetric_sampler import AsymmetricDistributedSampler
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 import json
 
@@ -32,6 +34,7 @@ from IPython import embed
 
 class Trainer:
     def __init__(self, options, rank, world_size):
+        torch.manual_seed(42)
         self.opt = options
         self.rank = rank
         self.world_size = world_size
@@ -128,10 +131,20 @@ class Trainer:
         for model_name in self.models:
             self.models[model_name] = SyncBatchNorm.convert_sync_batchnorm(self.models[model_name])
 
+        for model_name, model in self.models.items():
+            print(f"Checking parameters for model: {model_name}")
+            for idx, (name, param) in enumerate(model.named_parameters()):
+                print(f"Index: {idx}, Name: {name}, Size: {param.size()}")
+            
+
         # Move models to the appropriate device
         for model_name in self.models:
             self.models[model_name].to(self.device)
             self.parameters_to_train += list(self.models[model_name].parameters())
+
+            # Wrap the model in DDP
+            self.models[model_name] = DDP(self.models[model_name], device_ids=[self.rank])
+            
 
         # Register a hook to scale gradients according to the batch size factor
         def scale_gradients(grad):
@@ -198,9 +211,11 @@ class Trainer:
         val_dataset = self.dataset(
             self.opt.data_path, val_filenames, self.opt.height, self.opt.width,
             self.opt.frame_ids, 4, is_train=False, img_ext=img_ext)
+        val_sampler = DistributedSampler(
+            val_dataset, num_replicas=self.world_size, rank=self.rank, shuffle=False)
         self.val_loader = DataLoader(
-            val_dataset, self.opt.batch_size, True,
-            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)
+            val_dataset, self.opt.batch_size, sampler=val_sampler,
+            num_workers=self.opt.num_workers, pin_memory=True, drop_last=True)            
         self.val_iter = iter(self.val_loader)
 
         self.writers = {}

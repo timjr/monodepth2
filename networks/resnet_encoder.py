@@ -94,6 +94,10 @@ class ResnetEncoder(nn.Module):
         if num_layers > 34:
             self.num_ch_enc[1:] *= 4
 
+        # Set the final fully connected layer to identity since we are
+        # not using it and it's making DDP error out
+        self.encoder.fc = nn.Identity()
+        
     def forward(self, input_image):
         self.features = []
         x = (input_image - 0.45) / 0.225
